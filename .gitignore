@@ -9,6 +9,9 @@ wheels/
 # venv
 .venv
 
+# Local secrets (see .env.example)
+.env
+
 *.so
 
 logs
