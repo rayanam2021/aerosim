@@ -25,4 +25,4 @@ AeroSim is provided with an easy-to-use Python API, allowing extensive control o
 * [__Scene graph__](scene_graph_reference.md)
 * [__Simulink inegration__](simulink_integration.md)
 * [__SimReady asset creation__](usd_asset_pipeline.md)
-  
+* [__SHIFT missile interception__](shift_missile.md)

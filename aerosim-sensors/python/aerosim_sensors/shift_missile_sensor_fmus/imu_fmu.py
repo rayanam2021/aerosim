@@ -6,7 +6,7 @@ sensor reading that mimics a tactical-grade MEMS IMU.  The model includes:
 
 Accelerometer
   - Additive white Gaussian noise  (``accel_noise_std_mps2``, m/s²/√Hz × √Hz)
-  - Slow-varying bias (random-walk initialised at startup, ``accel_bias_std_mps2``)
+  - Slow-varying bias (random-walk initialized at startup, ``accel_bias_std_mps2``)
   - Scale-factor error (``accel_scale_error_ppm``)
 
 Gyroscope
@@ -114,7 +114,7 @@ class imu_fmu(Fmi3Slave):
         self._rng = np.random.default_rng(int(self.rng_seed))
         hz = max(self.update_rate_hz, 1.0)
         self._update_interval = 1.0 / hz
-        # Initialise fixed biases sampled at startup (changes slowly in reality).
+        # Initialize fixed biases sampled at startup (changes slowly in reality).
         self._accel_bias = self._rng.normal(0.0, self.accel_bias_std_mps2, 3)
         self._gyro_bias = self._rng.normal(0.0, self.gyro_bias_std_rps, 3)
         self._elapsed_since_update = self._update_interval  # force first step

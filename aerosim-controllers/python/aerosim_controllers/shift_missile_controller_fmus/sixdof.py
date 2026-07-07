@@ -31,7 +31,7 @@ GRAVITY = 9.80665  # m/s^2
 
 # ── Quaternion / rotation helpers ────────────────────────────────────────────
 def quat_normalize(q: np.ndarray) -> np.ndarray:
-    """Normalise a scalar-last quaternion; fall back to identity if degenerate."""
+    """Normalize a scalar-last quaternion; fall back to identity if degenerate."""
     n = float(np.linalg.norm(q))
     if n < 1e-12:
         return np.array([0.0, 0.0, 0.0, 1.0])

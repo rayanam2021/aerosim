@@ -53,7 +53,7 @@ _BASE_PRESSURES: list[float] = _compute_base_pressures()
 
 
 def isa(altitude_m: float) -> tuple[float, float, float, float]:
-    """Return ISA values at *altitude_m* metres above mean sea level.
+    """Return ISA values at *altitude_m* meters above mean sea level.
 
     Parameters
     ----------

@@ -1,7 +1,7 @@
 """
 Infrared (IR) seeker FMU for the SHIFT interceptor.
 
-A passive, body-fixed/gimballed IR seeker that reports the line-of-sight (LOS)
+A passive, body-fixed/gimbaled IR seeker that reports the line-of-sight (LOS)
 azimuth/elevation to the threat missile.  Being passive it provides **no range**
 — only bearing — which is exactly why the target navigation EKF fuses it with
 the semi-active radar (range + bearing).  The model captures the operationally

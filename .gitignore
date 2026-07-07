@@ -12,6 +12,9 @@ wheels/
 # Local secrets (see .env.example)
 .env
 
+# Luminary aero_sm TorchScript weights (proprietary; see docs/shift_missile.md).
+aerosim-dynamics-models/python/aerosim_dynamics_models/shift_missile_dynamics_fmus/mlp_model.pt
+
 *.so
 
 logs

@@ -9,7 +9,7 @@ force/moment vector, taking every channel into account:
 
     state  x = [Fx, Fy, Fz, Mx, My, Mz]            (body FRD)
     forecast/prior:
-        - surrogate-valid channels  -> centred on the surrogate value (tight Q)
+        - surrogate-valid channels  -> centered on the surrogate value (tight Q)
         - surrogate-unknown channels -> persistence prior (diffuse Q) so the
           observations alone determine them
     observation y = [ax, ay, az, d(p)/dt, d(q)/dt, d(r)/dt]   (body frame)
@@ -22,7 +22,7 @@ force/moment vector, taking every channel into account:
 A stochastic perturbed-observation EnKF analysis pulls the forecast toward the
 forces implied by the observed accelerations.  The result is a physically
 complete estimate of the aerodynamic + control loads, including the channels
-the surrogate never modelled, plus the per-channel bias of the surrogate.
+the surrogate never modeled, plus the per-channel bias of the surrogate.
 
 Inputs  (VehicleState topic): vehicle_state (ego ground truth)
 Inputs  (aux): sm_fx_n..sm_mz_nm + sm_valid_* (aero surrogate),
@@ -209,7 +209,7 @@ class corrector_fmu(Fmi3Slave):
         ])
 
     def _recenter(self, surrogate: np.ndarray, valid_mask: np.ndarray) -> None:
-        """Forecast step: valid channels re-centre on the surrogate; unknown
+        """Forecast step: valid channels re-center on the surrogate; unknown
         channels persist their current estimate. Then inflate by process noise."""
         if self._ensemble is None:
             return
@@ -248,7 +248,7 @@ class corrector_fmu(Fmi3Slave):
         R = self._obs_cov()
         pxy = (x_anom @ y_anom.T) / denom
         pyy = (y_anom @ y_anom.T) / denom + R
-        # Regularise + robust solve so the analysis can never blow up numerically.
+        # Regularize + robust solve so the analysis can never blow up numerically.
         pyy += np.eye(6) * (1e-6 * float(np.trace(pyy)) + 1e-9)
         innov = float(np.linalg.norm(obs - y_mean.flatten()))
         try:
@@ -258,7 +258,7 @@ class corrector_fmu(Fmi3Slave):
         noise = self._rng.multivariate_normal(np.zeros(6), R, size=n).T
         new_ens = ens + gain @ (obs.reshape(6, 1) + noise - pred)
         if not np.all(np.isfinite(new_ens)):
-            # Reject the pathological update; reinitialise around the surrogate.
+            # Reject the pathological update; reinitialize around the surrogate.
             self._ensemble = surrogate.reshape(6, 1) + self._rng.multivariate_normal(
                 np.zeros(6), self._process_cov(valid_mask), size=n
             ).T

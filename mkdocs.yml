@@ -26,4 +26,5 @@ nav:
   - Scene graph: 'scene_graph_reference.md'
   - Simulink integration: 'simulink_integration.md'
   - SimReady asset creation: 'usd_asset_pipeline.md'
+  - SHIFT missile interception: 'shift_missile.md'
   

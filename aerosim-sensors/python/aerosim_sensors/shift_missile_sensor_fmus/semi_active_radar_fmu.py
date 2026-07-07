@@ -5,7 +5,7 @@ A semi-active radar homing seeker: an external illuminator (e.g. the launch
 platform) floods the threat and the missile's receiver measures the reflected
 return.  Unlike the passive IR seeker it provides a full 3-D fix — range,
 range-rate (Doppler) and LOS bearing — but with coarser angular accuracy and a
-lower update rate.  Modelled effects:
+lower update rate.  Modeled effects:
 
   - Maximum detection range (radar-range-equation roll-off, hard-gated here).
   - Field-of-view gating about the ego boresight (body +x).

@@ -3,7 +3,7 @@ Structures / mass-properties FMU for the SHIFT missile (full inertia tensor).
 
 As the propulsion FMU burns propellant the vehicle mass, principal inertias and
 CG shift.  A slender axisymmetric missile has a small roll inertia (Ixx) and
-large, nearly equal pitch/yaw inertias (Iyy ~ Izz).  Each is modelled as a
+large, nearly equal pitch/yaw inertias (Iyy ~ Izz).  Each is modeled as a
 linear function of mass so the values stay physically consistent as propellant
 depletes.  A structural load factor is derived from the aerodynamic normal
 force fed back from the aerodynamics FMU.
