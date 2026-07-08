@@ -181,8 +181,12 @@ class imu_fmu(Fmi3Slave):
             + self._rng.normal(0.0, accel_sigma, 3)
         )
 
-        # True angular velocity from attitude differentiation.
-        delta_rot = rot * self._prev_rot.inv()
+        # True angular velocity from attitude differentiation, expressed in the
+        # BODY frame (strapdown gyro).  The body-frame increment is
+        # prev_rot^-1 * cur_rot (right composition); its rotation vector divided
+        # by dt is the body angular rate.  (Using cur_rot * prev_rot^-1 would give
+        # the world-frame rate, which is wrong for a body-mounted gyro.)
+        delta_rot = self._prev_rot.inv() * rot
         rotvec = delta_rot.as_rotvec()
         true_omega_body = rotvec / max(dt, 1e-6)
         self._prev_rot = rot

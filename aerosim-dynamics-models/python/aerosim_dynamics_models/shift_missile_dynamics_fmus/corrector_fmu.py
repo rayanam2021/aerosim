@@ -70,10 +70,20 @@ class corrector_fmu(Fmi3Slave):
         self.sm_valid_mx = 0.0
         self.sm_valid_my = 1.0
         self.sm_valid_mz = 0.0
+        # Surrogate per-channel 1-sigma (UQ) that drives the forecast process
+        # noise per channel (data-driven, replaces the fixed defaults when > 0).
+        self.sm_sigma_fx = 0.0
+        self.sm_sigma_fy = 0.0
+        self.sm_sigma_fz = 0.0
+        self.sm_sigma_mx = 0.0
+        self.sm_sigma_my = 0.0
+        self.sm_sigma_mz = 0.0
         for _n in (
             "sm_fx_n", "sm_fy_n", "sm_fz_n", "sm_mx_nm", "sm_my_nm", "sm_mz_nm",
             "sm_valid_fx", "sm_valid_fy", "sm_valid_fz",
             "sm_valid_mx", "sm_valid_my", "sm_valid_mz",
+            "sm_sigma_fx", "sm_sigma_fy", "sm_sigma_fz",
+            "sm_sigma_mx", "sm_sigma_my", "sm_sigma_mz",
         ):
             register_fmu3_var(self, _n, causality="input")
 
@@ -104,11 +114,20 @@ class corrector_fmu(Fmi3Slave):
         self.innovation_norm = 0.0
         self.ensemble_spread = 0.0
         self.ground_truth_valid = 0.0
+        # Posterior per-channel 1-sigma (UQ of the corrected force/moment).
+        self.std_fx_n = 0.0
+        self.std_fy_n = 0.0
+        self.std_fz_n = 0.0
+        self.std_mx_nm = 0.0
+        self.std_my_nm = 0.0
+        self.std_mz_nm = 0.0
         for _n in (
             "fx_corrected_n", "fy_corrected_n", "fz_corrected_n",
             "mx_corrected_nm", "my_corrected_nm", "mz_corrected_nm",
             "bias_fx_n", "bias_fy_n", "bias_fz_n",
             "bias_mx_nm", "bias_my_nm", "bias_mz_nm",
+            "std_fx_n", "std_fy_n", "std_fz_n",
+            "std_mx_nm", "std_my_nm", "std_mz_nm",
             "innovation_norm", "ensemble_spread", "ground_truth_valid",
         ):
             register_fmu3_var(self, _n, causality="output")
@@ -187,16 +206,31 @@ class corrector_fmu(Fmi3Slave):
             self.sm_valid_mx, self.sm_valid_my, self.sm_valid_mz,
         ], dtype=float)
 
+    def _surrogate_sigma(self) -> np.ndarray:
+        return np.array([
+            self.sm_sigma_fx, self.sm_sigma_fy, self.sm_sigma_fz,
+            self.sm_sigma_mx, self.sm_sigma_my, self.sm_sigma_mz,
+        ], dtype=float)
+
     def _process_std(self, valid_mask=None) -> np.ndarray:
+        """Per-channel forecast process std.
+
+        When the aerodynamics FMU supplies a positive surrogate 1-sigma
+        (``sm_sigma_*``) it drives the process noise directly (data-driven UQ);
+        otherwise the fixed defaults are used.  Unknown channels always take the
+        diffuse default so the observations alone determine them."""
         if valid_mask is None:
             valid_mask = self._valid_mask()
-        fstd = np.where(
+        sm_sigma = self._surrogate_sigma()
+        default_f = np.where(
             valid_mask[:3] > 0.5, self.proc_std_force_valid_n, self.proc_std_force_unknown_n
         )
-        mstd = np.where(
+        default_m = np.where(
             valid_mask[3:] > 0.5, self.proc_std_moment_valid_nm, self.proc_std_moment_unknown_nm
         )
-        return np.concatenate([fstd, mstd])
+        default = np.concatenate([default_f, default_m])
+        use_sm = (valid_mask > 0.5) & (sm_sigma > 0.0)
+        return np.where(use_sm, np.maximum(sm_sigma, 1e-6), default)
 
     def _process_cov(self, valid_mask=None) -> np.ndarray:
         return np.diag(self._process_std(valid_mask) ** 2)
@@ -308,5 +342,10 @@ class corrector_fmu(Fmi3Slave):
          self.bias_mx_nm, self.bias_my_nm, self.bias_mz_nm) = (float(v) for v in bias)
         self.innovation_norm = float(innov)
         if self._ensemble is not None:
-            self.ensemble_spread = float(np.mean(np.std(self._ensemble, axis=1)))
+            per_channel = np.std(self._ensemble, axis=1)
+            self.ensemble_spread = float(np.mean(per_channel))
+            (self.std_fx_n, self.std_fy_n, self.std_fz_n,
+             self.std_mx_nm, self.std_my_nm, self.std_mz_nm) = (
+                float(v) for v in per_channel
+            )
         self.ground_truth_valid = 1.0 if valid else 0.0

@@ -5,10 +5,24 @@ Role in the interception scenario
 ----------------------------------
 This FMU is the **perfect ground-truth plant** for the ego interceptor
 (``actor1``).  It integrates the full six-degree-of-freedom rigid-body
-equations of motion (see ``sixdof.py``) using a physically complete analytic
+equations of motion (see ``sixdof.py``, RK4) using a physically complete analytic
 aerodynamic model (all 6 force/moment components), the rocket thrust from the
 propulsion FMU, and the mass/inertia from the structures FMU.  It publishes a
 noise-free ``VehicleState`` on ``aerosim.actor1.vehicle_state``.
+
+Why 6-DOF EOM *and* a surrogate (design decision)
+-------------------------------------------------
+A high-fidelity, faster-than-real-time digital twin uses the **Newton-Euler
+rigid-body EOM as the plant** and lets an **aerodynamic model supply the
+force/moment coefficients** into those equations.  This is the reference
+architecture in the missile-simulation literature (e.g. JHU/APL 6-DOF GNC
+digital simulations; the open SRAAM 6-DOF simulation), where the coefficients
+come from wind-tunnel/DATCOM tables or CFD surrogates.  The Luminary ``aero_sm``
+surrogate plays exactly that coefficient-provider role.  So the answer is *both*:
+the EOM integrator here is the twin, and the surrogate (plus the analytic model
+as a fallback tier) provides the aerodynamics.  Pure analytic aero alone is only
+the fallback; the surrogate path is the high-fidelity path.  Integration is RK4
+with internal sub-stepping for numerical stability of the stiff, high-q airframe.
 
 The learned surrogate (partial)
 -------------------------------
@@ -53,8 +67,13 @@ from aerosim_data import dict_to_namespace
 from aerosim_data import types as aerosim_types
 
 from atmosphere import isa as _isa
+from airframe_geometry import (
+    derive_control_derivatives,
+    geometry_from_params,
+    geometry_param_defaults,
+)
 from sixdof import (
-    integrate_6dof,
+    integrate_6dof_rk4,
     quat_from_euler,
     quat_to_msg,
     ned_to_body,
@@ -115,12 +134,22 @@ class aerodynamics_sm_fmu(Fmi3Slave):
         self.sm_valid_mx = 0.0
         self.sm_valid_my = 1.0
         self.sm_valid_mz = 0.0
+        # Per-channel surrogate 1-sigma uncertainty (UQ). Predicted channels get
+        # a (relative + absolute) sigma inflated toward the domain edges where the
+        # surrogate extrapolates; unknown channels carry a large diffuse sigma.
+        self.sm_sigma_fx = 0.0
+        self.sm_sigma_fy = 0.0
+        self.sm_sigma_fz = 0.0
+        self.sm_sigma_mx = 0.0
+        self.sm_sigma_my = 0.0
+        self.sm_sigma_mz = 0.0
         # Flight condition + atmosphere.
         self.alpha_deg = 0.0
         self.beta_deg = 0.0
         self.mach_number = 0.0
         self.dynamic_pressure_pa = 0.0
         self.air_density_kgm3 = 0.0
+        self.air_pressure_pa = 101325.0
         self.speed_of_sound_mps = 0.0
         self.altitude_msl_m = 0.0
         self.model_source = "uninitialized"
@@ -144,8 +173,10 @@ class aerodynamics_sm_fmu(Fmi3Slave):
             "sm_mx_nm", "sm_my_nm", "sm_mz_nm",
             "sm_valid_fx", "sm_valid_fy", "sm_valid_fz",
             "sm_valid_mx", "sm_valid_my", "sm_valid_mz",
+            "sm_sigma_fx", "sm_sigma_fy", "sm_sigma_fz",
+            "sm_sigma_mx", "sm_sigma_my", "sm_sigma_mz",
             "alpha_deg", "beta_deg", "mach_number", "dynamic_pressure_pa",
-            "air_density_kgm3", "speed_of_sound_mps", "altitude_msl_m",
+            "air_density_kgm3", "air_pressure_pa", "speed_of_sound_mps", "altitude_msl_m",
             "ego_pos_n", "ego_pos_e", "ego_pos_d",
             "ego_vel_n", "ego_vel_e", "ego_vel_d",
             "ego_qw", "ego_qx", "ego_qy", "ego_qz", "airspeed_mps",
@@ -159,14 +190,15 @@ class aerodynamics_sm_fmu(Fmi3Slave):
         self.world_origin_altitude = 0.0
         register_fmu3_param(self, "world_origin_altitude")
 
-        # Reference geometry.
+        # Reference geometry (overwritten from airframe_geometry when enabled).
         self.ref_area_m2 = 0.0314   # pi/4 * d^2, d=0.2 m
         register_fmu3_param(self, "ref_area_m2")
         self.ref_diameter_m = 0.2
         register_fmu3_param(self, "ref_diameter_m")
 
-        # Aerodynamic derivatives (per rad unless noted); representative supersonic
-        # missile static + damping coefficients.
+        # Aerodynamic derivatives (per rad unless noted).  Control derivatives
+        # (CN_de, Cm_de, CY_dr, Cn_dr, Cl_da) are overwritten from the modular
+        # canard+tail geometry when ``use_geometry_aero`` is enabled.
         self.CA0 = 0.30
         register_fmu3_param(self, "CA0")
         self.CN_alpha = 15.0
@@ -194,6 +226,14 @@ class aerodynamics_sm_fmu(Fmi3Slave):
         self.Cl_da = -2.0
         register_fmu3_param(self, "Cl_da")
 
+        # Modular canard + tail geometry (see airframe_geometry.py).  Defaults
+        # match the Luminary SHIFT layout: 4 longer forward canards + 4 taller
+        # aft fins, diamond section, trapezoidal planform.  Set
+        # use_geometry_aero=0 to keep the hand-tuned control derivatives above.
+        for _k, _v in geometry_param_defaults().items():
+            setattr(self, _k, _v)
+            register_fmu3_param(self, _k)
+
         # Feature clamps for the surrogate's valid domain.
         self.min_mach = 0.3
         register_fmu3_param(self, "min_mach")
@@ -201,6 +241,22 @@ class aerodynamics_sm_fmu(Fmi3Slave):
         register_fmu3_param(self, "max_mach")
         self.max_abs_alpha_deg = 20.0
         register_fmu3_param(self, "max_abs_alpha_deg")
+
+        # Surrogate uncertainty model (UQ). Predicted-channel sigma =
+        # sqrt((rel*|value|)^2 + abs^2) * edge_inflation; unknown channels take a
+        # large diffuse sigma so the corrector/p_kill treat them as ~unobserved.
+        self.sm_rel_sigma = 0.05
+        register_fmu3_param(self, "sm_rel_sigma")
+        self.sm_abs_sigma_force_n = 50.0
+        register_fmu3_param(self, "sm_abs_sigma_force_n")
+        self.sm_abs_sigma_moment_nm = 20.0
+        register_fmu3_param(self, "sm_abs_sigma_moment_nm")
+        self.sm_edge_inflation = 3.0
+        register_fmu3_param(self, "sm_edge_inflation")
+        self.sm_unknown_sigma_force_n = 4000.0
+        register_fmu3_param(self, "sm_unknown_sigma_force_n")
+        self.sm_unknown_sigma_moment_nm = 1500.0
+        register_fmu3_param(self, "sm_unknown_sigma_moment_nm")
 
         # Initial conditions (NED, rad, m/s).
         self.init_pos_north_m = 0.0
@@ -236,9 +292,11 @@ class aerodynamics_sm_fmu(Fmi3Slave):
         self._omega = np.zeros(3)
         self._isa_rho = 1.225
         self._isa_a = 340.29
+        self._ca_fins = 0.0
 
     # ------------------------------------------------------------------ setup
     def enter_initialization_mode(self):
+        self._apply_geometry()
         self._load_model()
         self._pos = np.array(
             [self.init_pos_north_m, self.init_pos_east_m, self.init_pos_down_m],
@@ -259,6 +317,27 @@ class aerodynamics_sm_fmu(Fmi3Slave):
 
     def exit_initialization_mode(self):
         pass
+
+    def _apply_geometry(self) -> None:
+        """Overwrite control derivatives from the modular canard+tail geometry."""
+        if float(getattr(self, "use_geometry_aero", 1.0)) < 0.5:
+            self._ca_fins = 0.0
+            return
+        params = {k: getattr(self, k) for k in geometry_param_defaults()}
+        # Prefer live CG from structures if the structures FMU has already
+        # written mass props; otherwise use the geometry default cg_x_m.
+        geom = geometry_from_params(params)
+        derivs = derive_control_derivatives(geom)
+        self.ref_area_m2 = derivs["ref_area_m2"]
+        self.ref_diameter_m = derivs["ref_diameter_m"]
+        self.CN_de = derivs["CN_de"]
+        self.Cm_de = derivs["Cm_de"]
+        self.CY_dr = derivs["CY_dr"]
+        self.Cn_dr = derivs["Cn_dr"]
+        self.Cl_da = derivs["Cl_da"]
+        self._ca_fins = derivs["CA_fins"]
+        # Fixed-fin contribution to body lift/stability is left in CN_alpha /
+        # Cm_alpha (user-tunable); only the *control* derivatives are derived.
 
     def _load_model(self) -> None:
         try:
@@ -319,7 +398,7 @@ class aerodynamics_sm_fmu(Fmi3Slave):
             force_body = np.array([fx + self.thrust_n, fy, fz])  # thrust along +x
             moment_body = np.array([mx, my, mz])
 
-            self._pos, self._vel, self._quat, self._omega, accel_ned = integrate_6dof(
+            self._pos, self._vel, self._quat, self._omega, accel_ned = integrate_6dof_rk4(
                 self._pos, self._vel, self._quat, self._omega,
                 force_body, moment_body, self.mass_kg, inertia, h,
             )
@@ -358,7 +437,7 @@ class aerodynamics_sm_fmu(Fmi3Slave):
 
         de, da, dr = self.elevator_rad, self.aileron_rad, self.rudder_rad
 
-        CA = self.CA0
+        CA = self.CA0 + getattr(self, "_ca_fins", 0.0)
         CN = self.CN_alpha * alpha + self.CN_de * de
         CY = self.CY_beta * beta + self.CY_dr * dr
         Cl = self.Cl_p * p_hat + self.Cl_da * da
@@ -409,15 +488,41 @@ class aerodynamics_sm_fmu(Fmi3Slave):
         self.sm_fy_n = self.sm_mx_nm = self.sm_mz_nm = 0.0
         self.sm_valid_fy = self.sm_valid_mx = self.sm_valid_mz = 0.0
 
+        # --- Per-channel UQ sigmas ------------------------------------------
+        # Extrapolation inflation grows toward the trained-domain edges in Mach
+        # and alpha (unit at center -> sm_edge_inflation at the clamp limits).
+        edge = max(
+            abs(mach_c - 0.5 * (self.min_mach + self.max_mach))
+            / max(0.5 * (self.max_mach - self.min_mach), 1e-3),
+            abs(alpha_c) / max(self.max_abs_alpha_deg, 1e-3),
+        )
+        infl = 1.0 + (self.sm_edge_inflation - 1.0) * min(max(edge, 0.0), 1.0)
+
+        def _fsig(val):
+            return math.sqrt((self.sm_rel_sigma * abs(val)) ** 2
+                             + self.sm_abs_sigma_force_n ** 2) * infl
+
+        def _msig(val):
+            return math.sqrt((self.sm_rel_sigma * abs(val)) ** 2
+                             + self.sm_abs_sigma_moment_nm ** 2) * infl
+
+        self.sm_sigma_fx = _fsig(fx)
+        self.sm_sigma_fz = _fsig(fz)
+        self.sm_sigma_my = _msig(my)
+        self.sm_sigma_fy = self.sm_unknown_sigma_force_n
+        self.sm_sigma_mx = self.sm_unknown_sigma_moment_nm
+        self.sm_sigma_mz = self.sm_unknown_sigma_moment_nm
+
     # ------------------------------------------------------------- atmosphere
     def _altitude_msl(self) -> float:
         return self.world_origin_altitude - float(self._pos[2])
 
     def _refresh_atmosphere(self) -> None:
-        _, _, rho, a = _isa(self._altitude_msl())
+        _, p, rho, a = _isa(self._altitude_msl())
         self._isa_rho = rho
         self._isa_a = a
         self.air_density_kgm3 = rho
+        self.air_pressure_pa = p
         self.speed_of_sound_mps = a
         self.altitude_msl_m = self._altitude_msl()
 

@@ -47,6 +47,11 @@ kafka/kafka_logs.txt
 # Output MCAP sim data files
 *.mcap
 
+# SHIFT missile sweep / Monte-Carlo run outputs (reproducible from base + deltas)
+examples/runs/
+examples/config/*.results.json
+examples/config/*.generated.json
+
 # Aerosim modules
 aerosim-app
 aerosim-assets

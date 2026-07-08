@@ -1,0 +1,14 @@
+{
+    "name": "SHIFT interceptor vs cruise missile — master run",
+    "description": "Master configuration for the SHIFT missile interception digital twin. It selects one scenario (which in turn references the interceptor and threat designs) and one Monte-Carlo campaign for probability-of-kill estimation. Compose it into a full AeroSim sim-config with examples/shift_missile/compose_sim_config.py, or run the P_kill Monte-Carlo with examples/shift_missile/run_monte_carlo.py.",
+    "overview": {
+        "interceptor": "SHIFT ~200mm agile interceptor (6-DOF plant + Luminary aero_sm surrogate, solid motor, Euler-Bernoulli airframe, INS/target EKF GNC, three-loop autopilot, EnKF corrector)",
+        "threat": "subsonic cruise missile, 20 km, 8 km cruise, evasive weave",
+        "terminal_guidance": "PropNav/APN or receding-horizon MPC (selectable)",
+        "inner_loop": "RSLQR or three-loop PID (selectable)",
+        "products": "intercept trajectory, miss distance, structural margins, motor QoI, and P_kill with uncertainty bounds"
+    },
+    "scenario": "scenario_headon_intercept.json",
+    "monte_carlo": "monte_carlo.json",
+    "output_sim_config": "sim_config_shift_missile_intercept.generated.json"
+}

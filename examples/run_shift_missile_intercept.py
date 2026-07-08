@@ -1,66 +1,51 @@
 """
-Run the SHIFT missile interception scenario in AeroSim.
+Run the SHIFT missile interception scenario in AeroSim (distributed).
 
 Scenario
 --------
 Ego interceptor (actor1) engages a configurable threat missile (actor2).  The
 ego runs a full GNC stack; the threat is an autonomous, parameterised target.
 
-Data flow (all inter-FMU scalars travel on auxiliary JsonData topics)
----------------------------------------------------------------------
-    threat_missile ─(VehicleState + pos/vel aux)─> seekers / target EKF
+Configuration
+-------------
+Parameters live in the modular JSON files under ``config/shift_missile/``
+(missile, target, scenario, master).  This script composes them into a full
+sim-config immediately before launch so the distributed run always matches the
+standalone ``engagement.py`` harness.
 
-    Ego plant loop:
-      autopilot ─(fin + throttle cmd)─> servo_sm
-      servo_sm ─(throttle)─> propulsion_sm
-      servo_sm ─(fin deflections)─> aerodynamics_sm
-      propulsion_sm ─(thrust, propellant)─> aerodynamics_sm, structures_sm
-      structures_sm ─(mass, full inertia)─> aerodynamics_sm, corrector, autopilot
-      aerodynamics_sm ─(VehicleState truth + 6-DOF true/surrogate forces)─> ...
-
-    Sensors (from ego truth): imu (100 Hz), gnss (10 Hz), baro (25 Hz)
-    Seekers (ego vs threat):  ir (bearing-only, 100 Hz), radar (range+bearing, 20 Hz)
-
-    GNC:
-      ego_nav_ekf   (IMU+GNSS+baro)          ─(nav state)─> guidance, autopilot, target EKF
-      target_nav_ekf(radar+IR, ego nav)      ─(threat state)─> guidance
-      guidance (PropNav | MPC)               ─(accel cmd)─> autopilot
-      autopilot (PID | LQR)                  ─(fin cmds)─> servo_sm
-
-    corrector: full 6-DOF EnKF fusing ego ground-truth kinematics with the
-    partial (fx,fz,my) surrogate to reconstruct ALL six force/moment channels.
-
-Rapidly adjust the engagement by editing ``fmu_initial_vals`` in
-``config/sim_config_shift_missile_intercept.json`` — e.g. the threat's
-``launch_range_m``, ``cruise_altitude_m``, ``cruise_speed_mps``,
-``max_lateral_accel_g`` (agility), ``weave_amplitude_g`` (evasion); the
-guidance ``guidance_law`` ("propnav"/"mpc") and the autopilot
-``controller_type`` ("pid"/"lqr").
+Edit, for example:
+    config/shift_missile/scenario_headon_intercept.json   engagement geometry, overrides
+    config/shift_missile/missile_shift_interceptor.json   interceptor + GNC tuning
+    config/shift_missile/target_cruise_missile.json       threat behaviour
 
 Usage (from repo root):
     python examples/run_shift_missile_intercept.py
 
 Prerequisites:
     - Kafka running (launch_aerosim.sh / launch_aerosim.bat)
-    - Built FMUs (from repo root, run each module's build script):
-        aerosim-dynamics-models/build_shift_missile_dynamics_fmus.bat  (or .sh)
-        aerosim-controllers/build_shift_missile_controller_fmus.bat    (or .sh)
-        aerosim-sensors/build_shift_missile_sensor_fmus.bat            (or .sh)
-        aerosim-scenarios/build_shift_missile_scenario_fmus.bat        (or .sh)
-      (the dynamics build also generates a placeholder mlp_model.pt if the real
-       Luminary aero_sm weights are not present)
+    - Built FMUs in examples/fmu/ (run all four build_shift_missile_* scripts)
+    - Optional: mlp_model.pt in the dynamics FMU source folder before building
 """
 
 import os
+import sys
 
 from aerosim import AeroSim
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join("config", "sim_config_shift_missile_intercept.json")
+MASTER_CONFIG = os.path.join("config", "shift_missile", "master_intercept.json")
+CONFIG_FILE = os.path.join("config", "sim_config_shift_missile_intercept.generated.json")
 
 
 def main() -> None:
     os.chdir(SCRIPT_DIR)
+    sys.path.insert(0, os.path.join(SCRIPT_DIR, "shift_missile"))
+    import compose_sim_config as composer  # noqa: E402
+
+    master = os.path.join(SCRIPT_DIR, MASTER_CONFIG)
+    composer.main([master])
+    print(f"Launching distributed sim with {CONFIG_FILE}")
+
     sim = AeroSim()
     try:
         sim.run(CONFIG_FILE, sim_config_dir=SCRIPT_DIR)

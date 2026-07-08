@@ -6,20 +6,19 @@ set SRC=python\aerosim_dynamics_models\shift_missile_dynamics_fmus
 set REQ=%SRC%\requirements_shift_missile.txt
 set ATM=%SRC%\atmosphere.py
 set SIXDOF=%SRC%\sixdof.py
+set GEOM=%SRC%\airframe_geometry.py
 set MODEL=%SRC%\mlp_model.pt
-
-if not exist "%MODEL%" (
-    echo mlp_model.pt not found; generating placeholder surrogate...
-    python "%SRC%\create_placeholder_mlp_model.py" --out "%MODEL%"
-)
 
 if not exist "..\examples\fmu" mkdir "..\examples\fmu"
 
-rem aerodynamics bundles atmosphere.py, sixdof.py and the surrogate weights.
+rem aerodynamics bundles atmosphere.py, sixdof.py, airframe_geometry.py and, if
+rem present, the Luminary aero_sm surrogate weights (mlp_model.pt). Without the
+rem weights the FMU falls back to the analytic aero tier automatically.
 if exist "%MODEL%" (
-    pythonfmu3 build -f %SRC%\aerodynamics_sm_fmu.py %ATM% %SIXDOF% %MODEL% %REQ%
+    pythonfmu3 build -f %SRC%\aerodynamics_sm_fmu.py %ATM% %SIXDOF% %GEOM% %MODEL% %REQ%
 ) else (
-    pythonfmu3 build -f %SRC%\aerodynamics_sm_fmu.py %ATM% %SIXDOF% %REQ%
+    echo mlp_model.pt not found; building aerodynamics with the analytic fallback tier.
+    pythonfmu3 build -f %SRC%\aerodynamics_sm_fmu.py %ATM% %SIXDOF% %GEOM% %REQ%
 )
 pythonfmu3 build -f %SRC%\servo_sm_fmu.py %REQ%
 pythonfmu3 build -f %SRC%\structures_sm_fmu.py %REQ%

@@ -1,0 +1,33 @@
+{
+    "name": "Head-on cruise-missile intercept",
+    "description": "Ego SHIFT interceptor launched at 8 km altitude engages an inbound subsonic cruise missile 20 km downrange. The interceptor flies midcourse toward the predicted intercept point, then terminal-homes with the selected guidance law.",
+    "missile": "missile_shift_interceptor.json",
+    "target": "target_cruise_missile.json",
+    "clock": { "step_size_ms": 10, "pace_1x_scale": true },
+    "world": {
+        "origin": { "latitude": 35.0, "longitude": -117.0, "altitude": 0.0 },
+        "weather": { "preset": "ClearSky" }
+    },
+    "engagement": {
+        "ego": {
+            "init_pos_north_m": 0.0,
+            "init_pos_east_m": 0.0,
+            "init_pos_down_m": -8000.0,
+            "init_roll_rad": 0.0,
+            "init_pitch_rad": 0.0,
+            "init_yaw_rad": 0.0,
+            "init_speed_mps": 600.0
+        },
+        "target": {
+            "launch_range_m": 20000.0,
+            "cruise_altitude_m": 8000.0,
+            "cruise_speed_mps": 300.0,
+            "max_lateral_accel_g": 8.0,
+            "weave_amplitude_g": 2.0
+        }
+    },
+    "overrides": {
+        "guidance.guidance_law": "propnav",
+        "autopilot.controller_type": "lqr"
+    }
+}

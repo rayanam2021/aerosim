@@ -1,0 +1,25 @@
+{
+    "name": "shift_intercept_design_sweep",
+    "description": "Sweep manifest: run many engagement configurations without duplicating full config files. Every case is stored as a small delta (dotted 'fmu_id.param' overrides) on top of a single shared base master; the base is referenced once and content-hashed for provenance, so N configurations cost N small override dicts instead of N monolithic JSON files. 'cases' is an explicit list; 'grid' is expanded into the Cartesian product of the listed values and merged in. Set 'montecarlo.enabled' to run a dispersed P_kill campaign per case instead of a single deterministic engagement.",
+    "base_master": "master_intercept.json",
+    "sim_time_s": 40.0,
+    "dt_s": 0.01,
+    "seed": 2024,
+    "montecarlo": {
+        "enabled": false,
+        "n_runs": 50,
+        "lethal_radius_m": 8.0,
+        "damage_model": "carleton",
+        "confidence": 0.95
+    },
+    "cases": [
+        { "id": "baseline_propnav_lqr", "overrides": {} },
+        { "id": "mpc_lqr", "overrides": { "guidance.guidance_law": "mpc" } },
+        { "id": "propnav_pid", "overrides": { "autopilot.controller_type": "pid" } }
+    ],
+    "grid": {
+        "guidance.guidance_law": ["propnav", "mpc"],
+        "target.cruise_speed_mps": [250.0, 300.0, 350.0],
+        "target.max_lateral_accel_g": [4.0, 8.0]
+    }
+}

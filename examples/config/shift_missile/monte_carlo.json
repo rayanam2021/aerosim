@@ -1,0 +1,21 @@
+{
+    "name": "Head-on intercept P_kill Monte-Carlo",
+    "description": "Dispersed-parameter Monte-Carlo campaign that propagates surrogate/propulsion/target uncertainty into the miss-distance distribution and reports the single-shot probability of kill (P_kill) with a confidence interval. Uncertain params are dotted FMU-id.param keys drawn per run from the given distributions.",
+    "n_runs": 200,
+    "seed": 12345,
+    "sim_time_s": 40.0,
+    "dt_s": 0.01,
+    "lethal_radius_m": 8.0,
+    "damage_model": "carleton",
+    "confidence": 0.95,
+    "uncertain_params": {
+        "aerodynamics_sm.CN_alpha": { "distribution": "normal", "mean": 15.0, "std": 1.2 },
+        "aerodynamics_sm.Cm_alpha": { "distribution": "normal", "mean": -3.0, "std": 0.3 },
+        "aerodynamics_sm.CA0": { "distribution": "normal", "mean": 0.30, "std": 0.03 },
+        "propulsion_sm.c_star_mps": { "distribution": "normal", "mean": 1550.0, "std": 31.0 },
+        "propulsion_sm.burn_rate_coeff_a": { "distribution": "normal", "mean": 5.0e-5, "std": 2.5e-6 },
+        "target.launch_range_m": { "distribution": "normal", "mean": 20000.0, "std": 1500.0 },
+        "target.max_lateral_accel_g": { "distribution": "uniform", "low": 4.0, "high": 10.0 },
+        "target.weave_frequency_hz": { "distribution": "uniform", "low": 0.1, "high": 0.4 }
+    }
+}

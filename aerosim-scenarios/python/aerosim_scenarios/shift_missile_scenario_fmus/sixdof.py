@@ -86,7 +86,84 @@ def alpha_beta(v_body: np.ndarray) -> tuple[float, float]:
     return float(alpha), float(beta)
 
 
+# ── Quaternion kinematics ─────────────────────────────────────────────────────
+def quat_mul(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product of two scalar-last quaternions (q1 ⊗ q2)."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return np.array([
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    ])
+
+
+def quat_deriv(q_xyzw: np.ndarray, omega_body: np.ndarray) -> np.ndarray:
+    """Time-derivative of a body->NED scalar-last quaternion for body rates.
+
+    ``q_dot = 0.5 * q ⊗ [omega, 0]`` (omega expressed in the body frame)."""
+    w = np.asarray(omega_body, dtype=float)
+    return 0.5 * quat_mul(q_xyzw, np.array([w[0], w[1], w[2], 0.0]))
+
+
 # ── Rigid-body integration ────────────────────────────────────────────────────
+def integrate_6dof_rk4(
+    pos_ned: np.ndarray,
+    vel_ned: np.ndarray,
+    q_xyzw: np.ndarray,
+    omega_body: np.ndarray,
+    force_body: np.ndarray,
+    moment_body: np.ndarray,
+    mass: float,
+    inertia_diag: np.ndarray,
+    dt: float,
+    gravity: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Classical fourth-order Runge-Kutta step of the 6-DOF rigid-body EOM.
+
+    Body-frame forces/moments are held constant across the step (co-simulation
+    zero-order hold); the state derivative still captures the attitude-dependent
+    gravity/force rotation and the gyroscopic coupling, so RK4 is markedly more
+    accurate and stable than explicit Euler for the stiff high-q airframe.
+
+    State packed as ``[pos(3), vel(3), quat_xyzw(4), omega(3)]``.  Returns
+    ``(pos, vel, q, omega, accel_ned)`` advanced by ``dt``.
+    """
+    mass = max(float(mass), 1e-6)
+    I = np.maximum(np.asarray(inertia_diag, dtype=float), 1e-6)
+    fb = np.asarray(force_body, dtype=float)
+    mb = np.asarray(moment_body, dtype=float)
+    g_ned = np.array([0.0, 0.0, GRAVITY]) if gravity else np.zeros(3)
+
+    def deriv(state: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        q = state[6:10]
+        w = state[10:13]
+        rot = rot_from_quat(q)
+        accel = rot.apply(fb) / mass + g_ned
+        qd = quat_deriv(q, w)
+        ang_acc = (mb - np.cross(w, I * w)) / I
+        d = np.zeros(13)
+        d[0:3] = state[3:6]      # pos_dot = vel
+        d[3:6] = accel           # vel_dot
+        d[6:10] = qd             # quat_dot
+        d[10:13] = ang_acc       # omega_dot
+        return d, accel
+
+    s0 = np.concatenate([pos_ned, vel_ned, quat_normalize(q_xyzw), omega_body])
+    k1, a1 = deriv(s0)
+    k2, _ = deriv(s0 + 0.5 * dt * k1)
+    k3, _ = deriv(s0 + 0.5 * dt * k2)
+    k4, _ = deriv(s0 + dt * k3)
+    s1 = s0 + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+    pos = s1[0:3]
+    vel = s1[3:6]
+    q = quat_normalize(s1[6:10])
+    omega = s1[10:13]
+    return pos, vel, q, omega, a1
+
+
 def integrate_6dof(
     pos_ned: np.ndarray,
     vel_ned: np.ndarray,

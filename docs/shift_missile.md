@@ -10,14 +10,17 @@ For general AeroSim startup (Kafka, orchestrator, renderer), see [Running AeroSi
 
 The interception scenario simulates:
 
-1. **Ego vehicle (`actor1`)** — a SHIFT interceptor with a full 6-DOF quaternion plant, rocket propulsion, 3-axis fin actuators, and a partial Luminary `aero_sm` surrogate.
+1. **Ego vehicle (`actor1`)** — a SHIFT interceptor with a full 6-DOF quaternion plant integrated by **RK4**, a physics-based solid rocket motor, modular **4-canard + 4-tail** (diamond/trapezoid) geometry driving equivalent elevator/aileron/rudder control derivatives, an Euler–Bernoulli structural model with canard/tail load stations, and a partial Luminary `aero_sm` surrogate with per-channel uncertainty.
 2. **Threat vehicle (`actor2`)** — a configurable guided missile flying toward a defended asset, with optional evasive weave.
 3. **Perfect ground truth** — both vehicles publish noise-free `VehicleState` on component topics.
-4. **Estimated states** — ego 16-state quaternion INS and a 9-state threat tracker fuse sensors at mismatched rates.
-5. **GNC** — outer-loop guidance (Proportional Navigation or MPC-style ZEM) and inner-loop autopilot (PID or LQR) drive the ego fins.
-6. **Corrector** — a 6-DOF Ensemble Kalman Filter reconstructs all force/moment channels from ground-truth kinematics, including channels the ML surrogate does not predict.
+4. **Estimated states** — ego 16-state quaternion INS and a 9-state threat tracker fuse noisy, asynchronous sensors at mismatched rates.
+5. **Fire control + GNC** — a phased fire-control computer (IDLE → MIDCOURSE → TERMINAL) runs initial guidance to a predicted intercept point, then terminal homing with a selectable law — true vector **Proportional Navigation / Augmented PN** or a full **receding-horizon MPC** (QP solved by an interior-point solver; the old Zero-Effort-Miss shortcut has been removed) — and an inner-loop **three-loop autopilot** (PID or online LQR) drives the ego fins.
+6. **Corrector** — a 6-DOF Ensemble Kalman Filter reconstructs all force/moment channels from ground-truth kinematics, driven by the surrogate's per-channel uncertainty, and exposes posterior standard deviations.
+7. **Uncertainty quantification → P_kill** — surrogate/propulsion/structural uncertainty is propagated into a single-shot probability of kill (P_kill) with confidence bounds via a Monte-Carlo campaign.
 
 Simulation clock: **10 ms** (100 Hz). All FMUs step on the same clock; sensors expose a `measurement_ready` flag when a new sample is available so filters can handle asynchronous rates.
+
+> **Detailed math and references** live in a `README.md` inside each of the four `shift_missile_*_fmus` folders (dynamics, controllers, sensors, scenarios). This guide is the operational overview; those READMEs are the technical reference.
 
 ---
 
@@ -40,17 +43,24 @@ examples/fmu/
 
 Shared utility modules (`atmosphere.py`, `sixdof.py`) are **bundled into each FMU** that needs them at build time so every FMU remains self-contained.
 
-Example configuration and launcher:
+**Modular configuration** (small, composable JSON files — see [Configuring the scenario](#configuring-the-scenario)):
 
 ```text
-examples/config/sim_config_shift_missile_intercept.json
-examples/run_shift_missile_intercept.py
+examples/config/shift_missile/master_intercept.json      high-level run selector
+examples/config/shift_missile/scenario_headon_intercept.json
+examples/config/shift_missile/missile_shift_interceptor.json
+examples/config/shift_missile/target_cruise_missile.json
+examples/config/shift_missile/monte_carlo.json            P_kill campaign
+examples/config/shift_missile/sweep_intercept.json        multi-config sweep
 ```
 
-Developer closed-loop smoke test (no Kafka; stubs FMU runtime):
+**Standalone tooling** (no Kafka/orchestrator; stubs the FMU runtime in-process, faster than real time):
 
 ```text
-_shift_intercept_smoke_test.py
+examples/shift_missile/compose_sim_config.py   modular JSON -> full AeroSim sim-config
+examples/shift_missile/engagement.py           one closed-loop engagement + telemetry
+examples/shift_missile/run_monte_carlo.py       dispersed P_kill campaign
+examples/shift_missile/run_sweep.py             many configurations via delta storage
 ```
 
 ---
@@ -106,12 +116,13 @@ _shift_intercept_smoke_test.py
 
 **Role:** Perfect ground-truth 6-DOF plant for the ego interceptor.
 
-- Integrates full rigid-body equations with quaternions (`sixdof.py`).
-- Uses a complete **analytic** aerodynamic model (all six force/moment components) plus rocket thrust.
+- Integrates full rigid-body 6-DOF equations of motion with quaternions using **RK4** (`integrate_6dof_rk4` in `sixdof.py`). The EOM are *fed by* the Luminary surrogate for aerodynamic coefficients/forces, with the analytic model as fallback — a high-fidelity, faster-than-real-time hybrid rather than pure-analytic or pure-surrogate.
+- Uses a complete **analytic** aerodynamic model (all six force/moment components) plus rocket thrust when the surrogate is unavailable.
 - Evaluates the local **`aero_sm` MLP surrogate**, which in this iteration predicts only:
   - `force_x`, `force_z`, `moment_y` (pitch-plane channels)
 - Unknown surrogate channels are published as `0.0` with **`sm_valid_* = 0.0`**. Known channels have **`sm_valid_* = 1.0`**. (JSON aux topics cannot carry `NaN`/`Inf`, so validity flags are the transport-safe equivalent of null.)
-- Atmosphere (density, pressure, speed of sound) comes from **ICAO ISA** via `atmosphere.py` at live altitude — nothing is hardcoded.
+- Emits **per-channel surrogate uncertainty** `sm_sigma_fx/fy/fz/mx/my/mz` (relative + absolute σ with edge inflation) consumed by the corrector.
+- Atmosphere (density, pressure, speed of sound) comes from **ICAO ISA** via `atmosphere.py` at live altitude — nothing is hardcoded. Also outputs `air_pressure_pa` for the propulsion ambient correction.
 - Internal sub-stepping (`max_substep_s`, default 1 ms) keeps the stiff plant stable at the 10 ms co-simulation step.
 
 **Key aux inputs:** `elevator_rad`, `aileron_rad`, `rudder_rad`, `thrust_n`, `mass_kg`, `Ixx`, `Iyy`, `Izz`
@@ -124,11 +135,11 @@ Three independent first-order fin actuators (elevator, aileron, rudder) with rat
 
 ### `propulsion_sm_fmu.py`
 
-Boost/sustain solid rocket motor with finite propellant; outputs `thrust_n`, `propellant_fraction`, `mass_flow_kg_s`.
+Physics-based **0-D internal-ballistics** solid rocket motor (with an optional liquid mode). A cylindrical BATES-style grain burns per **St. Robert's law** (\(r = a\,p_c^{\,n}\)); chamber pressure is solved from the mass balance at equilibrium, and thrust is ambient-pressure corrected. The nozzle throat can be auto-sized for a design chamber pressure. Outputs `thrust_n`, `thrust_sigma_n` (uncertainty), `propellant_fraction`, `mass_flow_kg_s`, `chamber_pressure_pa`, and quantities of interest `isp_s`, `total_impulse_ns`, `burn_time_s`.
 
 ### `structures_sm_fmu.py`
 
-Mass and principal inertias (`Ixx`, `Iyy`, `Izz`) vs. propellant fraction; structural load factor from normal force.
+**Euler–Bernoulli beam** load solver. From the aerodynamic normal/side forces and thrust it computes internal shear and bending moment, peak bending stress (\(\sigma = Mc/I\)), axial stress, combined von-Mises stress, **margin of safety** (1.5 factor of safety), and the **first bending natural frequency**, plus a probabilistic `prob_structural_failure` from load/material scatter. Also outputs mass and principal inertias (`Ixx`, `Iyy`, `Izz`) and CG vs. propellant fraction.
 
 ### `corrector_fmu.py`
 
@@ -136,13 +147,13 @@ Mass and principal inertias (`Ixx`, `Iyy`, `Izz`) vs. propellant fraction; struc
 
 - **State:** `[Fx, Fy, Fz, Mx, My, Mz]` in body FRD.
 - **Observations:** specific force and angular acceleration derived from ego **ground-truth** `VehicleState`.
-- Surrogate-valid channels are centered on the ML prediction; unknown channels use a diffuse persistence prior so kinematics alone determine them.
-- Outputs corrected forces/moments and estimated surrogate bias on valid channels.
+- Surrogate-valid channels are centered on the ML prediction; **per-channel surrogate 1-σ (`sm_sigma_*`) dynamically sets the process noise**. Unknown channels use a diffuse persistence prior so kinematics alone determine them.
+- Outputs corrected forces/moments plus **posterior per-channel standard deviations** (`std_fx_n`, …) that feed downstream P_kill uncertainty.
 
 ### Shared: `atmosphere.py`, `sixdof.py`
 
 - **`atmosphere.py`** — ICAO standard atmosphere (0–47 km).
-- **`sixdof.py`** — quaternion helpers and semi-implicit 6-DOF integrator.
+- **`sixdof.py`** — quaternion kinematics helpers (`quat_mul`, `quat_deriv`) and a classical **RK4** 6-DOF integrator (`integrate_6dof_rk4`).
 
 ---
 
@@ -150,26 +161,37 @@ Mass and principal inertias (`Ixx`, `Iyy`, `Izz`) vs. propellant fraction; struc
 
 Controllers live in **`aerosim-controllers`**, consistent with existing JSBSim autopilot / flight-controller FMUs in this repo.
 
-### `guidance_fmu.py` — outer loop
+### `guidance_fmu.py` — fire control + outer loop
+
+Sequences the engagement through fire-control phases IDLE → MIDCOURSE (lead-collision toward the predicted intercept point) → TERMINAL (selected homing law).
 
 | Parameter | Values | Description |
 |-----------|--------|-------------|
-| `guidance_law` | `"propnav"` or `"mpc"` | Proportional Navigation vs. optimal ZEM-style predictive guidance |
-| `nav_gain` | float | PropNav navigation constant |
-| `mpc_gain` | float | ZEM guidance gain |
+| `guidance_law` | `"propnav"` or `"mpc"` | Terminal homing: true vector Proportional Navigation vs. full receding-horizon MPC |
+| `nav_gain` | float | PropNav effective navigation ratio \(N'\) |
+| `augmented_propnav` | 0/1 | Add the APN target-acceleration feed-forward term |
+| `terminal_range_m` | float | Range at which midcourse hands over to terminal homing |
+| `midcourse_gain`, `midcourse_max_g` | floats | Lead-collision gain and energy-managed accel cap |
+| `mpc_horizon`, `mpc_w_miss`, `mpc_w_effort`, `mpc_w_rate` | — | MPC horizon length and QP weights |
+| `command_ramp_s` | float | Soft-start ramp on the command at guidance hand-off (default 0 = off) |
 | `max_accel_g` | float | Acceleration command limit |
 
-Inputs: ego nav estimate + target nav estimate. Outputs: `a_cmd_n/e/d`, range, closing speed, time-to-go, LOS rate, ZEM, `guidance_active`.
+Inputs: ego nav estimate + target nav estimate (+ optional launcher cue). Outputs: `a_cmd_n/e/d`, range, closing speed, time-to-go, LOS rate, PIP, `guidance_phase`, `guidance_active`. **The Zero-Effort-Miss law has been removed**; `zem_m` remains as a diagnostic only.
 
 ### `autopilot_fmu.py` — inner loop
 
+Classical **three-loop** skid-to-turn autopilot: the guidance NED acceleration command is converted to incidence commands (\(\alpha,\beta\)) via quasi-static trim, an incidence-trim integral outer loop removes steady error, and a low-latency **rate-gyro** inner loop damps the short-period mode.
+
 | Parameter | Values | Description |
 |-----------|--------|-------------|
-| `controller_type` | `"pid"` or `"lqr"` | Fixed-gain PID vs. online LQR from short-period linearization |
-| `max_alpha_cmd_rad` | float | Angle-of-attack command limit |
-| `lqr_q_angle`, `lqr_q_rate`, `lqr_r_fin` | floats | LQR weights |
+| `controller_type` | `"pid"` or `"lqr"` | Fixed rate-damping gain vs. online LQR short-period Riccati gain |
+| `use_gyro_rate` | 0/1 | Close the fast loop on the raw IMU gyro (1, default) or nav estimate (0) |
+| `max_incidence_rad` | float | Incidence (α/β) command clamp (~17° default) |
+| `ki_accel` | float | Incidence-trim integral gain [1/s] |
+| `kq_rate` | float | Fixed rate-damping gain (PID option) |
+| `lqr_q_angle`, `lqr_q_rate`, `lqr_r_fin` | floats | LQR short-period weights |
 
-Skid-to-turn: pitch/yaw channels track lateral acceleration from guidance; roll channel holds wings level via moment-coefficient feedback inverted through `Cl_da`.
+Roll channel holds wings level via moment-coefficient feedback inverted through `Cl_da`.
 
 ### `ego_nav_ekf_fmu.py` — ego navigation
 
@@ -240,7 +262,7 @@ Full path on this machine (adjust for your clone):
 
 1. **`aerodynamics_sm_fmu`** loads the file via parameter `mlp_model_path` (default `"mlp_model.pt"`). It searches the path as given, then the FMU source directory.
 2. **`build_shift_missile_dynamics_fmus.bat` / `.sh`** bundles `mlp_model.pt` into `aerodynamics_sm_fmu.fmu` when present. If the file is missing, the FMU falls back to analytic aero at runtime.
-3. **`sim_config_shift_missile_intercept.json`** sets `"mlp_model_path": "mlp_model.pt"` under the aerodynamics FMU's `fmu_initial_vals` (filename inside the built FMU bundle).
+3. **`missile_shift_interceptor.json`** sets `"mlp_model_path": "mlp_model.pt"` under the aerodynamics FMU block (filename inside the built FMU bundle); the composer injects it into the generated sim-config.
 
 **Expected model I/O:**
 
@@ -331,74 +353,99 @@ source .venv/bin/activate          # Linux
 .venv\Scripts\activate             # Windows
 ```
 
-### 3. Launch the scenario
+### 3. Compose and launch the scenario
+
+The modular config is composed into a full AeroSim sim-config, then launched:
 
 ```sh
-cd examples
-python run_shift_missile_intercept.py
+# From repo root — generate the sim-config from the modular master file
+python examples/shift_missile/compose_sim_config.py examples/config/shift_missile/master_intercept.json
+# -> writes examples/config/sim_config_shift_missile_intercept.generated.json
 ```
 
-The script loads `config/sim_config_shift_missile_intercept.json`, registers all 15 FMUs, and runs until you press Enter.
+Then run it through the standard AeroSim launcher (registers all 15 FMUs). See [Running AeroSim simulations](running_aerosim.md).
 
-### 4. Headless numerical test (optional)
+### 4. Headless standalone runs (no Kafka, faster than real time)
 
-Without Kafka or built FMUs, you can exercise the Python FMU logic directly:
+The standalone harness stubs the FMU runtime and runs the entire wired stack in one Python process — ideal for tuning, CI, and Monte-Carlo.
+
+**Single engagement + telemetry:**
 
 ```sh
-# From repo root
-python _shift_intercept_smoke_test.py              # default: propnav + lqr
-python _shift_intercept_smoke_test.py mpc pid      # alternate laws
+# From repo root:  python examples/shift_missile/engagement.py [propnav|mpc] [lqr|pid]
+python examples/shift_missile/engagement.py propnav lqr
+```
+
+Expected output (nominal head-on case; abbreviated):
+
+```text
+[engagement] law=propnav controller=lqr model=analytic
+  t[s]   range[m]   alt[m]  mach  ph    MoS nav   |acmd|   alpha    elev
+  1.01    19030.1   7998.0  2.34   1   6.22   1      9.7    6.83   -1.46
+  ...
+ 14.01     1148.9   8135.8  2.76   2   7.87   1    294.2   -2.00   -3.88
+
+  miss distance   : 367.4 m at t=14.96 s
+  final mach      : 2.72
+  total impulse   : 207.6 kN.s over 7.24 s
+  min struct MoS  : 31.80
+  RESULT: MISS
+```
+
+> **Note on `model=analytic`:** if `torch` cannot load `mlp_model.pt`, the plant uses the analytic aero fallback and prints `model=analytic`. This is expected without the proprietary weights.
+
+**Monte-Carlo P_kill campaign:**
+
+```sh
+python examples/shift_missile/run_monte_carlo.py --runs 200
+```
+
+Expected output (abbreviated):
+
+```text
+[monte-carlo] Head-on intercept P_kill Monte-Carlo
+  runs=200  lethal_radius=8.0 m  damage_model=carleton  confidence=95%
+  ...
+  miss distance   min=... CEP=... mean=... p90=... max=... m
+  P_kill (Carleton, r_L=8 m) = 0.0xx  [0.0xx, 0.0xx]  (95% CI)
+  P_kill (cookie-cutter)     = 0.0xx  [0.0xx, 0.0xx]  (Wilson 95%)
+  wrote summary -> examples/config/master_intercept.results.json
 ```
 
 ---
 
 ## Configuring the scenario
 
-Edit `examples/config/sim_config_shift_missile_intercept.json`.
+The scenario is described by **small, composable JSON files** so many scenarios can be built without duplicating a large monolithic config. The topology (the FMU graph) is fixed in `compose_sim_config.py`; the JSON files carry only parameters, world/clock, and engagement geometry.
 
-### Threat behavior
-
-Under the `threat_missile` FMU block, `fmu_initial_vals`:
-
-```json
-"launch_range_m": 20000.0,
-"cruise_altitude_m": 8000.0,
-"cruise_speed_mps": 300.0,
-"max_lateral_accel_g": 8.0,
-"weave_amplitude_g": 2.0,
-"weave_frequency_hz": 0.2
+```text
+master_intercept.json          high-level run: which scenario + which Monte-Carlo campaign
+  └─ scenario_headon_intercept.json   world/clock + engagement geometry + which missile & target
+       ├─ missile_shift_interceptor.json   interceptor design + GNC parameters (per-FMU)
+       └─ target_cruise_missile.json       threat missile parameters
+  └─ monte_carlo.json           P_kill campaign: n_runs, lethal radius, damage model, uncertain params
 ```
 
-Changes take effect on the next simulation start (rebuild FMUs not required for parameter-only edits).
+- **`missile_shift_interceptor.json`** — per-FMU `fmus` blocks (aerodynamics, servo, propulsion, structures, corrector, sensors, guidance, autopilot, EKFs). Guidance/autopilot law selection, gains, motor geometry, structural properties, sensor noise, EKF tuning.
+- **`target_cruise_missile.json`** — threat `threat_missile` parameters (see the threat table above).
+- **`scenario_headon_intercept.json`** — `world.origin`, `clock`, `engagement.ego` (initial position/attitude/speed; NED down positive, `-8000` ≈ 8000 m MSL when origin altitude is 0), `engagement.target` (launch geometry, cruise, weave), and free-form `overrides` (e.g. `"guidance.guidance_law": "mpc"`).
+- **`master_intercept.json`** — references a scenario and a Monte-Carlo file and names the composed output; the single entry point for a run.
 
-### Guidance and autopilot laws
+Parameter-only edits take effect on the next composition/run (no FMU rebuild required). Signals are mapped through `fmu_aux_input_mapping` / `fmu_aux_output_mapping` — see [Simulation configuration reference](sim_config.md).
 
-```json
-// guidance FMU
-"guidance_law": "propnav",   // or "mpc"
-"nav_gain": 3.0,
-"max_accel_g": 15.0
+### Many configurations: delta-based sweeps
 
-// autopilot FMU
-"controller_type": "lqr",    // or "pid"
-"max_alpha_cmd_rad": 0.20
+To run many varying configurations **without duplicating full config files**, use the sweep runner. A sweep manifest references the base master **once** (content-hashed for provenance) and stores each case as a small `overrides` delta; cases can be listed explicitly and/or generated as the Cartesian product of a `grid`:
+
+```sh
+python examples/shift_missile/run_sweep.py examples/config/shift_missile/sweep_intercept.json
+python examples/shift_missile/run_sweep.py --montecarlo     # P_kill campaign per case
 ```
 
-### Ego initial conditions
+Outputs go to `examples/runs/<sweep>_<timestamp>/`:
 
-Under `aerodynamics_sm` `fmu_initial_vals`:
-
-```json
-"init_pos_down_m": -8000.0,
-"init_speed_mps": 600.0,
-"init_yaw_rad": 0.0
-```
-
-NED down is positive downward; `-8000` m down ≈ 8000 m MSL when `world_origin_altitude` is 0.
-
-### Sensor and filter tuning
-
-Each FMU block has its own `fmu_initial_vals` (noise standard deviations, update rates, EnKF ensemble size, etc.). Scalar signals are mapped through `fmu_aux_input_mapping` / `fmu_aux_output_mapping` — see [Simulation configuration reference](sim_config.md).
+- **`manifest.json`** — base reference + base content hash + every case delta and its scalar result summary (human-readable campaign index).
+- **`results.jsonl`** — one JSON record per run (append-friendly, streaming; loads directly into pandas/DuckDB). A 10 000-case campaign costs one base file plus a compact override list, not 10 000 monolithic JSON blobs, and every resolved config is reproducible from `base + delta`.
 
 ---
 
@@ -443,7 +490,7 @@ The corrector EnKF uses tight process noise on valid channels and diffuse noise 
 |---------|--------------|--------|
 | `analytic (mlp_model.pt not found)` in `model_source` | Weights not bundled | Copy `mlp_model.pt` to dynamics folder and rebuild aerodynamics FMU |
 | Torch load error on Windows / Python 3.13 | Environment issue | Use supported Python/torch combo, or rely on analytic fallback |
-| Ego loses energy / misses target | Aggressive guidance | Reduce `max_accel_g`, `max_alpha_cmd_rad`; tune `nav_gain` |
+| Ego loses energy / misses target | Aggressive guidance | Reduce `max_accel_g`, `max_incidence_rad`, `midcourse_max_g`; tune `nav_gain` |
 | `guidance_active = 0` | Nav or target track not valid | Wait for GNSS fix and radar lock; check seeker FOV/range |
 | Seekers never lock | Geometry / FOV | Reduce `launch_range_m` or increase `max_lock_range_m` / FOV params |
 
@@ -454,3 +501,10 @@ The corrector EnKF uses tight process noise on valid channels and diffuse noise 
 - [FMU reference](fmu_reference.md) — creating and registering FMUs
 - [Simulation configuration reference](sim_config.md) — JSON schema and topic mapping
 - [Conventions](conventions.md) — frames and message types
+
+**Per-folder technical READMEs** (executive summary, detailed math, component descriptions, references):
+
+- `aerosim-dynamics-models/python/aerosim_dynamics_models/shift_missile_dynamics_fmus/README.md`
+- `aerosim-controllers/python/aerosim_controllers/shift_missile_controller_fmus/README.md`
+- `aerosim-sensors/python/aerosim_sensors/shift_missile_sensor_fmus/README.md`
+- `aerosim-scenarios/python/aerosim_scenarios/shift_missile_scenario_fmus/README.md`

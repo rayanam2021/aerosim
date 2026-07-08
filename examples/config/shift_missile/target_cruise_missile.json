@@ -1,0 +1,19 @@
+{
+    "name": "Subsonic cruise missile",
+    "description": "Sea-skimming/low-cruise subsonic anti-ship style threat: constant cruise altitude and speed with an optional evasive weave and modest lateral agility. Baseline target for the head-on intercept scenario; override launch_range_m / cruise_* / max_lateral_accel_g in the scenario file to define other threats.",
+    "fmus": {
+        "threat_missile": {
+            "launch_range_m": 20000.0,
+            "launch_bearing_deg": 0.0,
+            "cruise_altitude_m": 8000.0,
+            "cruise_speed_mps": 300.0,
+            "max_axial_accel_mps2": 30.0,
+            "max_lateral_accel_g": 8.0,
+            "target_north_m": 0.0,
+            "target_east_m": 0.0,
+            "weave_amplitude_g": 2.0,
+            "weave_frequency_hz": 0.2,
+            "onboard_nav_error_std_m": 10.0
+        }
+    }
+}

@@ -5,11 +5,14 @@ cd "$(dirname "$0")"
 SRC=python/aerosim_controllers/shift_missile_controller_fmus
 REQ=$SRC/requirements_shift_missile.txt
 SIXDOF=$SRC/sixdof.py
+QP=$SRC/qp_solver.py
+GEOM=$SRC/airframe_geometry.py
 
 mkdir -p ../examples/fmu
 
-pythonfmu3 build -f $SRC/guidance_fmu.py $REQ
-pythonfmu3 build -f $SRC/autopilot_fmu.py $SIXDOF $REQ
+# guidance bundles the interior-point QP solver used by the MPC law.
+pythonfmu3 build -f $SRC/guidance_fmu.py $QP $REQ
+pythonfmu3 build -f $SRC/autopilot_fmu.py $SIXDOF $GEOM $REQ
 pythonfmu3 build -f $SRC/ego_nav_ekf_fmu.py $REQ
 pythonfmu3 build -f $SRC/target_nav_ekf_fmu.py $REQ
 

@@ -1,28 +1,44 @@
 """
-Inner-loop autopilot FMU for the SHIFT interceptor.
+Inner-loop autopilot FMU for the SHIFT interceptor (three-loop acceleration
+autopilot, skid-to-turn).
 
-Tracks the acceleration command from the guidance FMU by deflecting the pitch
-(elevator), yaw (rudder) and roll (aileron) fins.  A skid-to-turn (STT) strategy
-is used: the pitch and yaw channels generate the commanded lateral accelerations
-while the roll channel holds wings level.
+The autopilot converts the guidance maneuver-acceleration command into fin
+deflections using the classic tactical-missile **three-loop acceleration
+autopilot**, closed on low-latency inertial measurements:
 
-Two interchangeable inner-loop laws are selectable via ``controller_type``:
+    outer loop   acceleration.  A PI compensator drives the measured body-axis
+                 lateral specific force (from the *accelerometer*, not the
+                 navigation filter) to the command.  The accelerometer is used
+                 because it is a direct, low-lag measurement of the controlled
+                 output; feeding back incidence estimated from the (lagged) nav
+                 velocity destabilises the loop at high dynamic pressure.
 
-    "pid"  Fixed-gain PID on the angle-of-attack / sideslip error with body-rate
-           damping and a moment-trim feed-forward.
-    "lqr"  Optimal state feedback: at every step the short-period {alpha,q} and
-           {beta,r} linear models are built from the live flight condition
-           (q-bar, speed, mass, inertia + aero derivatives) and the algebraic
-           Riccati equation is solved to obtain the feedback gains.
+    inner loop   body rate.  Rate feedback from the *rate gyro* (low latency)
+                 damps the airframe short-period mode.
 
-All feedback uses the *navigation estimate* (attitude, body rates, velocity),
-never ground truth.  Gravity is fed forward so the commanded specific force
-matches what the accelerometers will sense.
+The PI output is mapped to a fin deflection through the analytic control
+effectiveness d(a)/d(fin) evaluated at the live flight condition, so the loop
+gain is automatically gain-scheduled with dynamic pressure, Mach, mass and
+inertia (the loop crossover stays roughly constant across the trajectory).
+
+Two interchangeable designs set the rate-damping gain:
+
+    "lqr"  Each step the short-period model {alpha, q} (and {beta, r}) is built
+           from the live flight condition and the algebraic Riccati equation is
+           solved for the optimal rate-feedback gain (Zarchan; Nesline &
+           Zarchan; Bryson & Ho).
+
+    "pid"  Fixed rate-damping gain plus the same PI acceleration compensator.
+
+Roll is held wings-level by a model-based P-D law that commands a roll-moment
+coefficient and inverts the aileron derivative (sign-robust).
 
 Inputs  (aux): a_cmd_{n,e,d}, guidance_active (guidance)
                nav_q{w,x,y,z}, nav_p/q/r, nav_vel_{n,e,d}, nav_valid (ego EKF)
+               gyro_{p,q,r}, accel_{x,y,z} (strapdown IMU, low latency)
                qbar_pa, airspeed_mps, mass_kg, Iyy, Izz (flight condition)
-Outputs (aux): elevator_cmd_rad, aileron_cmd_rad, rudder_cmd_rad, throttle_cmd
+Outputs (aux): elevator_cmd_rad, aileron_cmd_rad, rudder_cmd_rad, throttle_cmd,
+               az_cmd_mps2, ay_cmd_mps2, az_ach_mps2, ay_ach_mps2
 """
 
 from __future__ import annotations
@@ -33,19 +49,25 @@ from scipy.linalg import solve_continuous_are
 from scipy.spatial.transform import Rotation
 
 from aerosim_core import register_fmu3_param, register_fmu3_var
+from airframe_geometry import (
+    derive_control_derivatives,
+    geometry_from_params,
+    geometry_param_defaults,
+)
 
 GRAVITY = 9.80665
 
 
 class autopilot_fmu(Fmi3Slave):
-    """PID / LQR selectable 3-axis skid-to-turn autopilot."""
+    """Three-loop PID / LQR skid-to-turn acceleration autopilot."""
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
         self.author = "AeroSim"
-        self.description = "SHIFT interceptor inner-loop autopilot (PID / LQR)"
+        self.description = "SHIFT interceptor three-loop acceleration autopilot (PID / LQR)"
 
+        # --- Inputs -----------------------------------------------------------
         self.a_cmd_n = 0.0
         self.a_cmd_e = 0.0
         self.a_cmd_d = 0.0
@@ -57,19 +79,30 @@ class autopilot_fmu(Fmi3Slave):
         self.nav_p = 0.0
         self.nav_q = 0.0
         self.nav_r = 0.0
+        # Raw strapdown IMU (low latency): rate gyro + accelerometer specific
+        # force in body FRD.  The inner rate loop and outer acceleration loop are
+        # closed on these, not on the navigation-filter estimate (which lags).
+        self.gyro_p = 0.0
+        self.gyro_q = 0.0
+        self.gyro_r = 0.0
+        self.accel_x = 0.0
+        self.accel_y = 0.0
+        self.accel_z = 0.0
         self.nav_vel_n = 0.0
         self.nav_vel_e = 0.0
         self.nav_vel_d = 0.0
         self.nav_valid = 0.0
         self.qbar_pa = 0.0
         self.airspeed_mps = 1.0
-        self.mass_kg = 500.0
-        self.Iyy = 300.0
-        self.Izz = 300.0
+        self.mass_kg = 200.0
+        self.Iyy = 205.0
+        self.Izz = 205.0
         for _n in (
             "a_cmd_n", "a_cmd_e", "a_cmd_d", "guidance_active",
             "nav_qw", "nav_qx", "nav_qy", "nav_qz",
             "nav_p", "nav_q", "nav_r",
+            "gyro_p", "gyro_q", "gyro_r",
+            "accel_x", "accel_y", "accel_z",
             "nav_vel_n", "nav_vel_e", "nav_vel_d", "nav_valid",
             "qbar_pa", "airspeed_mps", "mass_kg", "Iyy", "Izz",
         ):
@@ -78,18 +111,33 @@ class autopilot_fmu(Fmi3Slave):
         self.time = 0.0
         register_fmu3_var(self, "time", causality="independent")
 
+        # --- Outputs ----------------------------------------------------------
         self.elevator_cmd_rad = 0.0
         self.aileron_cmd_rad = 0.0
         self.rudder_cmd_rad = 0.0
         self.throttle_cmd = 1.0
-        for _n in ("elevator_cmd_rad", "aileron_cmd_rad", "rudder_cmd_rad", "throttle_cmd"):
+        self.az_cmd_mps2 = 0.0
+        self.ay_cmd_mps2 = 0.0
+        self.az_ach_mps2 = 0.0
+        self.ay_ach_mps2 = 0.0
+        for _n in (
+            "elevator_cmd_rad", "aileron_cmd_rad", "rudder_cmd_rad", "throttle_cmd",
+            "az_cmd_mps2", "ay_cmd_mps2", "az_ach_mps2", "ay_ach_mps2",
+        ):
             register_fmu3_var(self, _n, causality="output")
 
+        # --- Parameters -------------------------------------------------------
         # "pid" or "lqr"
         self.controller_type = "lqr"
         register_fmu3_param(self, "controller_type")
+        # Close inner rate loop / outer accel loop on the raw IMU (1) or the nav
+        # estimate (0).  IMU is the low-latency, robust default.
+        self.use_gyro_rate = 1.0
+        register_fmu3_param(self, "use_gyro_rate")
 
-        # Reference geometry + aero derivatives (match the plant defaults).
+        # Reference geometry + dimensional aero derivatives (match the plant).
+        # Control derivatives are overwritten from modular canard+tail geometry
+        # when use_geometry_aero is enabled (same module as the plant).
         self.ref_area_m2 = 0.0314
         register_fmu3_param(self, "ref_area_m2")
         self.ref_diameter_m = 0.2
@@ -117,51 +165,64 @@ class autopilot_fmu(Fmi3Slave):
         self.Cl_da = -2.0
         register_fmu3_param(self, "Cl_da")
 
-        # PID gains (on alpha/beta error + rate damping).
-        self.kp_pitch = 6.0
-        register_fmu3_param(self, "kp_pitch")
-        self.ki_pitch = 2.0
-        register_fmu3_param(self, "ki_pitch")
-        self.kd_pitch = 0.6
-        register_fmu3_param(self, "kd_pitch")
-        self.kp_yaw = 6.0
-        register_fmu3_param(self, "kp_yaw")
-        self.ki_yaw = 2.0
-        register_fmu3_param(self, "ki_yaw")
-        self.kd_yaw = 0.6
-        register_fmu3_param(self, "kd_yaw")
+        for _k, _v in geometry_param_defaults().items():
+            setattr(self, _k, _v)
+            register_fmu3_param(self, _k)
 
-        # LQR weights.
-        self.lqr_q_angle = 100.0
+        # Outer incidence-trim integral (q-bar independent) + inner rate damping.
+        self.ki_accel = 3.0         # incidence-trim integral gain [1/s]
+        register_fmu3_param(self, "ki_accel")
+        self.kq_rate = 0.30         # rad fin per (rad/s) body rate (PID option)
+        register_fmu3_param(self, "kq_rate")
+        self.max_incidence_rad = 0.30   # incidence-command clamp (~17 deg)
+        register_fmu3_param(self, "max_incidence_rad")
+
+        # LQR short-period weights for the optimal rate-damping design.
+        self.lqr_q_angle = 5.0
         register_fmu3_param(self, "lqr_q_angle")
-        self.lqr_q_rate = 1.0
+        self.lqr_q_rate = 2.0
         register_fmu3_param(self, "lqr_q_rate")
-        self.lqr_r_fin = 20.0
+        self.lqr_r_fin = 200.0
         register_fmu3_param(self, "lqr_r_fin")
 
-        # Roll stabilisation (gains are in roll-moment-coefficient units; the
-        # commanded Cl is inverted through Cl_da to get the aileron angle, so the
-        # sign is correct regardless of the aileron derivative's sign).
+        # Roll stabilization (roll-moment-coefficient units, inverted through Cl_da).
         self.kp_roll = 0.4
         register_fmu3_param(self, "kp_roll")
         self.kd_roll = 0.15
         register_fmu3_param(self, "kd_roll")
 
-        self.max_fin_rad = 0.436332  # 25 deg
+        self.max_fin_rad = 0.436332       # 25 deg
         register_fmu3_param(self, "max_fin_rad")
-        self.max_alpha_cmd_rad = 0.349066  # 20 deg
-        register_fmu3_param(self, "max_alpha_cmd_rad")
+        self.max_accel_cmd_mps2 = 300.0   # accel-command clamp (~30 g)
+        register_fmu3_param(self, "max_accel_cmd_mps2")
 
-        self._int_pitch = 0.0
+        self._int_pitch = 0.0             # accel-error integral (m/s)
         self._int_yaw = 0.0
 
     def enter_initialization_mode(self):
+        self._apply_geometry()
         self._int_pitch = 0.0
         self._int_yaw = 0.0
 
     def exit_initialization_mode(self):
         pass
 
+    def _apply_geometry(self) -> None:
+        """Match plant control derivatives from the modular canard+tail geometry."""
+        if float(getattr(self, "use_geometry_aero", 1.0)) < 0.5:
+            return
+        params = {k: getattr(self, k) for k in geometry_param_defaults()}
+        geom = geometry_from_params(params)
+        derivs = derive_control_derivatives(geom)
+        self.ref_area_m2 = derivs["ref_area_m2"]
+        self.ref_diameter_m = derivs["ref_diameter_m"]
+        self.CN_de = derivs["CN_de"]
+        self.Cm_de = derivs["Cm_de"]
+        self.CY_dr = derivs["CY_dr"]
+        self.Cn_dr = derivs["Cn_dr"]
+        self.Cl_da = derivs["Cl_da"]
+
+    # ------------------------------------------------------------------- step
     def do_step(self, current_time: float, step_size: float) -> bool:
         self.time = current_time + step_size
         self.throttle_cmd = 1.0
@@ -170,52 +231,88 @@ class autopilot_fmu(Fmi3Slave):
             self.elevator_cmd_rad = 0.0
             self.aileron_cmd_rad = 0.0
             self.rudder_cmd_rad = 0.0
+            self._int_pitch = 0.0
+            self._int_yaw = 0.0
             return True
 
         rot = Rotation.from_quat([self.nav_qx, self.nav_qy, self.nav_qz, self.nav_qw])
-        # Desired specific force in body = R^-1 (a_cmd - g).
         a_cmd_ned = np.array([self.a_cmd_n, self.a_cmd_e, self.a_cmd_d])
         g_ned = np.array([0.0, 0.0, GRAVITY])
-        f_des_body = rot.inv().apply(a_cmd_ned - g_ned)
-        ay_cmd = float(f_des_body[1])
-        az_cmd = float(f_des_body[2])
+        # Required *aerodynamic* body specific force = R^-1(a_cmd - g): the fins
+        # must produce the guidance maneuver AND hold the airframe against
+        # gravity, so gravity is subtracted here.
+        f_req_body = rot.inv().apply(a_cmd_ned - g_ned)
+        lim = self.max_accel_cmd_mps2
+        az_req = float(np.clip(f_req_body[2], -lim, lim))
+        ay_req = float(np.clip(f_req_body[1], -lim, lim))
 
-        # Estimated aero angles from nav velocity.
+        # Rate feedback source (raw gyro is the low-latency default).
+        if self.use_gyro_rate > 0.5:
+            p_fb, q_fb, r_fb = self.gyro_p, self.gyro_q, self.gyro_r
+        else:
+            p_fb, q_fb, r_fb = self.nav_p, self.nav_q, self.nav_r
+
         v_ned = np.array([self.nav_vel_n, self.nav_vel_e, self.nav_vel_d])
         v_body = rot.inv().apply(v_ned)
-        speed = max(float(np.linalg.norm(v_body)), 1.0)
+        vspeed = max(float(np.linalg.norm(v_body)), 1.0)
         alpha = float(np.arctan2(v_body[2], v_body[0]))
-        beta = float(np.arcsin(np.clip(v_body[1] / speed, -1.0, 1.0)))
+        beta = float(np.arcsin(np.clip(v_body[1] / vspeed, -1.0, 1.0)))
 
         qbar = max(self.qbar_pa, 1.0)
         S = self.ref_area_m2
         m = max(self.mass_kg, 1e-3)
+        speed = max(float(self.airspeed_mps), 1.0)
 
-        # Map lateral accel commands to angle commands (quasi-static).
-        # a_z = -qbar S CN_alpha alpha / m ; a_y = qbar S CY_beta beta / m
-        alpha_cmd = self._clamp(
-            -az_cmd * m / (qbar * S * self.CN_alpha), self.max_alpha_cmd_rad
-        )
-        beta_cmd = self._clamp(
-            ay_cmd * m / (qbar * S * self.CY_beta), self.max_alpha_cmd_rad
-        )
+        # --- Outer loop: required specific force -> incidence command ---------
+        # Quasi-static trim a_z = -(qbar S/m) CN_alpha alpha inverts to alpha_ff.
+        # The loop is closed on the *incidence* error (q-bar independent); the
+        # slow incidence integrator trims out steady model error / gravity.
+        cna = self.CN_alpha if abs(self.CN_alpha) > 1e-6 else 15.0
+        cyb = self.CY_beta if abs(self.CY_beta) > 1e-6 else -15.0
+        mi = self.max_incidence_rad
+        alpha_ff = self._clamp(-az_req * m / (qbar * S * cna), mi)
+        beta_ff = self._clamp(ay_req * m / (qbar * S * cyb), mi)
+        int_lim = mi / max(self.ki_accel, 1e-6)
+        self._int_pitch = float(np.clip(self._int_pitch + (alpha_ff - alpha) * step_size,
+                                        -int_lim, int_lim))
+        self._int_yaw = float(np.clip(self._int_yaw + (beta_ff - beta) * step_size,
+                                      -int_lim, int_lim))
+        alpha_cmd = self._clamp(alpha_ff + self.ki_accel * self._int_pitch, mi)
+        beta_cmd = self._clamp(beta_ff + self.ki_accel * self._int_yaw, mi)
 
+        # --- Inner loop: trim feed-forward + gyro rate damping ----------------
+        # A statically-stable airframe self-trims to the commanded incidence for
+        # the feed-forward fin, so NO fast incidence/acceleration feedback is
+        # used (both are non-minimum-phase or laggy at high q-bar).  Only the
+        # low-latency gyro closes the fast loop, which is minimum-phase and
+        # robust.  LQR sets the damping gain optimally; PID uses a fixed gain.
         if str(self.controller_type).strip().lower() == "lqr":
-            de = self._lqr_pitch(alpha, alpha_cmd, self.nav_q, qbar, speed)
-            dr = self._lqr_yaw(beta, beta_cmd, self.nav_r, qbar, speed)
+            kq_p = self._lqr_rate_gain(self.CN_alpha, self.Cm_alpha, self.Cm_q,
+                                       self.CN_de, self.Cm_de, self.Iyy, qbar, speed, m)
+            kq_r = self._lqr_rate_gain(self.CY_beta, self.Cn_beta, self.Cn_r,
+                                       self.CY_dr, self.Cn_dr, self.Izz, qbar, speed, m)
         else:
-            de, dr = self._pid(alpha, alpha_cmd, beta, beta_cmd, step_size)
+            kq_p = kq_r = float(self.kq_rate)
 
-        # Roll stabilisation (hold wings level): command a restoring roll-moment
-        # coefficient, then invert the aileron derivative to get the deflection.
+        de_ff = -self.Cm_alpha * alpha_cmd / self.Cm_de
+        dr_ff = -self.Cn_beta * beta_cmd / self.Cn_dr
+        de = de_ff + kq_p * q_fb
+        dr = dr_ff + kq_r * r_fb
+
+        # --- Roll: wings-level P-D on roll angle + roll-rate ------------------
         roll, _, _ = rot.as_euler("xyz")
-        cl_cmd = -(self.kp_roll * roll + self.kd_roll * self.nav_p)
+        cl_cmd = -(self.kp_roll * roll + self.kd_roll * p_fb)
         cl_da = self.Cl_da if abs(self.Cl_da) > 1e-6 else -2.0
         da = cl_cmd / cl_da
 
         self.elevator_cmd_rad = self._clamp(de, self.max_fin_rad)
         self.rudder_cmd_rad = self._clamp(dr, self.max_fin_rad)
         self.aileron_cmd_rad = self._clamp(da, self.max_fin_rad)
+
+        # Report commanded aero specific force and model-based achieved value.
+        self.az_cmd_mps2, self.ay_cmd_mps2 = az_req, ay_req
+        self.az_ach_mps2 = -(qbar * S / m) * cna * alpha
+        self.ay_ach_mps2 = (qbar * S / m) * cyb * beta
         return True
 
     def terminate(self):
@@ -223,58 +320,31 @@ class autopilot_fmu(Fmi3Slave):
         self.time = 0.0
 
     # ------------------------------------------------------------------- laws
-    def _pid(self, alpha, alpha_cmd, beta, beta_cmd, dt):
-        e_p = alpha_cmd - alpha
-        e_y = beta_cmd - beta
-        self._int_pitch = np.clip(self._int_pitch + e_p * dt, -0.5, 0.5)
-        self._int_yaw = np.clip(self._int_yaw + e_y * dt, -0.5, 0.5)
-        de_ff = -self.Cm_alpha * alpha_cmd / self.Cm_de
-        dr_ff = -self.Cn_beta * beta_cmd / self.Cn_dr
-        de = de_ff + self.kp_pitch * e_p + self.ki_pitch * self._int_pitch - self.kd_pitch * self.nav_q
-        dr = dr_ff + self.kp_yaw * e_y + self.ki_yaw * self._int_yaw - self.kd_yaw * self.nav_r
-        return de, dr
+    def _lqr_rate_gain(self, C_force, C_mom, C_momrate, C_force_fin, C_mom_fin,
+                       inertia, qbar, speed, m):
+        """Optimal body-rate feedback gain from the short-period Riccati soln.
 
-    def _lqr_pitch(self, alpha, alpha_cmd, q, qbar, speed):
+        Builds the linear short-period model {incidence, rate} at the live flight
+        condition and returns the (positive) rate-feedback gain used for damping.
+        The sign is chosen so that de = ... + kq*rate opposes the rate (the fin
+        moment derivative is negative)."""
         S, d = self.ref_area_m2, self.ref_diameter_m
-        m = max(self.mass_kg, 1e-3)
-        Iyy = max(self.Iyy, 1e-6)
-        Z_alpha = -qbar * S * self.CN_alpha / (m * speed)
-        Z_de = -qbar * S * self.CN_de / (m * speed)
-        M_alpha = qbar * S * d * self.Cm_alpha / Iyy
-        M_q = qbar * S * d * d * self.Cm_q / (2.0 * speed * Iyy)
-        M_de = qbar * S * d * self.Cm_de / Iyy
-        A = np.array([[Z_alpha, 1.0], [M_alpha, M_q]])
+        I = max(inertia, 1e-6)
+        Z_a = -qbar * S * C_force / (m * speed)
+        M_a = qbar * S * d * C_mom / I
+        M_q = qbar * S * d * d * C_momrate / (2.0 * speed * I)
+        M_de = qbar * S * d * C_mom_fin / I
+        Z_de = -qbar * S * C_force_fin / (m * speed)
+        A = np.array([[Z_a, 1.0], [M_a, M_q]])
         B = np.array([[Z_de], [M_de]])
-        K = self._lqr_gain(A, B)
-        de_ff = -self.Cm_alpha * alpha_cmd / self.Cm_de
-        x = np.array([alpha - alpha_cmd, q])
-        return float(de_ff - K @ x)
-
-    def _lqr_yaw(self, beta, beta_cmd, r, qbar, speed):
-        S, d = self.ref_area_m2, self.ref_diameter_m
-        m = max(self.mass_kg, 1e-3)
-        Izz = max(self.Izz, 1e-6)
-        Y_beta = qbar * S * self.CY_beta / (m * speed)
-        Y_dr = qbar * S * self.CY_dr / (m * speed)
-        N_beta = qbar * S * d * self.Cn_beta / Izz
-        N_r = qbar * S * d * d * self.Cn_r / (2.0 * speed * Izz)
-        N_dr = qbar * S * d * self.Cn_dr / Izz
-        # State [beta, r]; beta_dot = Y_beta beta - r + Y_dr dr
-        A = np.array([[Y_beta, -1.0], [N_beta, N_r]])
-        B = np.array([[Y_dr], [N_dr]])
-        K = self._lqr_gain(A, B)
-        dr_ff = -self.Cn_beta * beta_cmd / self.Cn_dr
-        x = np.array([beta - beta_cmd, r])
-        return float(dr_ff - K @ x)
-
-    def _lqr_gain(self, A, B):
         Q = np.diag([self.lqr_q_angle, self.lqr_q_rate])
         R = np.array([[self.lqr_r_fin]])
         try:
             P = solve_continuous_are(A, B, Q, R)
-            return (np.linalg.inv(R) @ B.T @ P).flatten()
+            K = (np.linalg.inv(R) @ B.T @ P).flatten()
+            return float(-K[1])
         except Exception:
-            return np.array([1.0, 0.1])
+            return float(self.kq_rate)
 
     def _clamp(self, x, lim):
         return float(max(-lim, min(lim, x)))
